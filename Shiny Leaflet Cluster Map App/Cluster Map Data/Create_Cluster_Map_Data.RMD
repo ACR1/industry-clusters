@@ -1,0 +1,503 @@
+---
+title: "Convert Point Data to Clustered Points"
+author: "A.C. Repella for NoCo REDI"
+date: "Fall 2019"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+
+## Overview
+
+This markdown document summarizes the process of using a list of individual business data to create a criteria based "cluster" map of businesses using the U.S. Cluster Mapping / Porter / Harvard Cluster system.
+
+This RMD file is extensively commented to support novice R users.
+
+This specific file is released under CC-BY_SA 4.0. Any linked data or U.S. Cluster Mapping or Emsi Specific Terminology is not included under this CC license.
+
+
+
+## User Defined Functions and Global Variables
+
+This code chunk defines some globals and functions.
+
+```{r setup, echo=TRUE, message= FALSE, results="hide"}
+
+# These are libraries that are needed
+require(tidyverse) # for tidy cleaning/organizing/aggregating data
+require(readxl) # importing an Excel file
+require(magrittr) # included for the %<>% special pipe
+library(sp) # 
+require(knitr) # for Kable tables
+require(stats) # for weighted.mean()
+require(scales) # for rescaling values
+```
+
+
+
+```{r setup2, echo=TRUE}
+
+# these are criteria thresholds see meets_critera(x) below
+MIN_ESTABS <- 3
+MAX_MAXEMP_RATIO <- 0.7
+
+# final file ends up as a CSV table
+OUTPUT_FILENAME <- "fake_data_cluster_gravity_points.csv"
+
+
+# FUNCTION DEFINTIONS -----------------------------------
+
+# FUNCTION geographic_midpoint(lon,lat,weight)
+# Calculate Great Circle Midpoint between lat lon pairs, w/ opt weight factor
+# vectors should be matched by index (lon[1] belongs with lat[1], etc.)
+# assumes all lat/lons are valid decimal degrees and match by index.
+# returns DF with 2 cols 1 row (lat, lon)
+# this isn't my function, but I don't have the source, and its pretty generic.
+geographic_midpoint <- function(lon, lat, weight = NULL) {
+  if (is.null(weight)) {
+    weight <- rep(1, length(lon))
+  }
+  # degrees to radians
+  lat <- lat * pi / 180
+  lon <- lon * pi / 180
+  # cartesian coordinates
+  x <- cos(lat) * cos(lon)
+  y <- cos(lat) * sin(lon)
+  z <- sin(lat)
+  # weighted mean
+  x <- weighted.mean(x, w = weight)
+  y <- weighted.mean(y, w = weight)
+  z <- weighted.mean(z, w = weight)
+  # convert to lat and lon
+  lon <- atan2(y, x) * 180 / pi
+  hyp <- sqrt(x * x + y * y)
+  lat <- atan2(z, hyp) * 180 / pi
+
+  data.frame(lon = lon, lat = lat)
+}
+
+## FUNCTION return_mean_lon(lon,lat)
+##   = lazy helper to return simple numeric mean lon using geographic_midpoint()
+return_mean_lon <- function(lon, lat, weight = NULL) {
+  as.numeric(geographic_midpoint(lon, lat, weight)[1])
+}
+
+## FUNCTION return_mean_lon(lon,lat)
+##  lazy helper to return simple numeric mean lat using geographic_midpoint()
+return_mean_lat <- function(lon, lat, weight = NULL) {
+  as.numeric(geographic_midpoint(lon, lat, weight)[2])
+}
+
+
+## FUNCTION meets_criteria(estabs, maxemp_ratio)
+## tests to see if the number of establishments (estabs)
+## AND max_emp / total_emp for a given location meet "completeness criteria"
+## expects data.frame("estabs" = numeric,  "max_emp_ratio" = numeric)
+##
+## What makes each cluster center of gravity complete?
+## that is the criteria. This is different based on mapping goals.
+meets_criteria <- function(x) {
+  MeetsCriteria <- ifelse(x$estabs >= MIN_ESTABS &
+    x$max_emp_ratio <= MAX_MAXEMP_RATIO,
+  TRUE,
+  FALSE
+  )
+  return(MeetsCriteria)
+}
+
+
+# this calculates the distance between a point and
+# all other points in its Cluster
+# it picks the nearest non-self points to merge with
+# assumes that data is sorted such that the largest items are at the top
+# (smallest row index) so that if there is a tie in minimum distance,
+# the point will merge with the larger (higher emp) of the ties
+
+get_merge_candidates <- function(x) {
+  x$mergewith <- NA
+  len <- dim(x)[1]
+  for (i in 1:len) {
+    if (x$MeetsCriteria[i] == FALSE) {
+      d <- spDistsN1(as.matrix(x[, c("LON", "LAT")]),
+        as.matrix(x[i, c("LON", "LAT")]),
+        longlat = TRUE
+      )
+      ## d[i] always equals 0 (self), so we artificially make it
+      ## impossible to be nearest neighbor indice
+      d[i] <- max(d) + 9999999
+      x$mergewith[i] <- x$ID[which(d == min(d))[1]]
+    }
+  }
+  return(x)
+}
+
+
+# FUNCTION merge_rows() takes a dataframe with LON LAT ID & employment fields
+# assumes keep_id is a single value, merge id can be vector.
+# IDs are unique ids, not indices.
+# merges rows keep_id and merge_id, reassigns merged values to keep_id row
+merge_rows <- function(df, keep_id, merge_id) {
+  ## calculate new employment weighted mean
+  i <- which(df$ID == keep_id)
+  j <- which(df$ID %in% merge_id)
+
+  merge.df <- df[c(i, j), ]
+  new_midpoints <- geographic_midpoint(merge.df$LON, merge.df$LAT, merge.df$employment)
+
+  new_row <- df[i, ]
+  new_row$ID <- paste(merge.df$ID, collapse = ",")
+  new_row$Cluster <- merge.df$Cluster[1]
+  new_row$tract <- merge.df$tract[1]
+  new_row$LON <- as.numeric(new_midpoints[1])
+  new_row$LAT <- as.numeric(new_midpoints[2])
+  new_row$employment <- sum(merge.df$employment)
+  new_row$max_employment <- max(merge.df$max_employment)
+  new_row$estabs <- sum(merge.df$estabs)
+  new_row$max_emp_ratio <- new_row$max_employment / new_row$employment
+  new_row$MeetsCriteria <- meets_criteria(new_row)
+  new_row$mergewith <- NA
+
+  df[i, ] <- new_row
+  df <- df[-j, ]
+  return(df)
+}
+```
+
+
+
+## Prep your initial data
+
+You  can use data from any source where you can extract geolocated establishments with employment estimates and assigned NAICS. Common sources could include Database USA or Gazelle. This can obviously be augmented with better data (where available) From your own group's business CRM, or some combination of sources. To get the most valuable mapping you want your list of businesses to be
+
+1) as complete as possible
+2) as accurate as possible
+3) for the largest region that makes sense for your work (ours incorporated a wider area than the administrative boundaries of our work to include our labor pool/commuters -- the net benefit being that this shows how our cities relate to other cities in our larger region in terms of employment "hubs" by cluster)
+
+
+The initial data source is expected to be a clean data set in which EACH row represents 1 business establishment with complete information for a point in time snapshot.  This code will not handle data quality issues well.
+
+It must include
+
+* Geolocation (Latitude Longitude points as standard decimal degrees)
+* Employment
+* Emsi compatible NAICS
+
+It should be similarly formatted with the same column names as our example data.
+
+We provide an example template with entirely synthetic (randomly generated) values. We do not provide code to clean/prep data to the initial example data level. You basically need to start with data that matches our example's column names.
+
+
+```{r prereq}
+# this dataframe is a list of geocoded business establishments with NAICS
+# we provide an example file with fake data for our region
+# fake means: it's randomly generated. Any resemblance to
+# a real business location is purely coincidental.
+
+df <- read_csv("example_synthetic_business_loc_data.csv",
+  col_types = cols(
+    biz_id = col_number(),
+    clusterNAICS = col_character(), employment = col_number(),
+    lat = col_double(), lon = col_double(),
+    tract = col_character()
+  )
+)
+
+
+## some useful column name definitions:
+## clusterNAICS =  NAICS codes pre-crosswalked to Emsi Compatible NAICS
+## lat = decimal degree latitude
+## lon = decimal degree longitude
+## employment = employment headcount for establishment
+## biz_id = a unique identifyer (optional, not used)
+## tract = a census FIPS tract id in standard 11 char format.
+
+# our tract column is used as a 'seed' for gathering clusters.
+# we FIPs coded our clusters using the FCC API
+# but, you could use zip code or some other sub-city scale coding instead.
+
+print(summary(df))
+
+# this file is a crosswalk from NAICS definitions to the Porter Clusters.
+# more details are in the file.
+cluster_xwalk <- read_excel("../../Shared_Files/NAICS_crosswalks_to_Cluster_system.xlsx")
+
+# '%<>%' is a magrittr pipe that means
+#  "take this variable, feed it to the function, and then re-assign the result'
+df %<>% left_join(cluster_xwalk, by = c("clusterNAICS" = "NAICS"))
+
+
+kable(head(df, 4), caption = "first lines of the crosswalked business table")
+```
+
+## Creating "centers of gravity"
+
+First, summarize the establishments per unique geography -- in this case, we're using tract.
+
+
+```{r first_pass}
+
+# group by the Cluster and the "seed" geography and then aggregate stats
+# if your unique geog is not tract,
+# you'll need to change the group_by column name
+# here, employment serves as a weighting factor for recalculating location
+df_byseed <- df %>%
+  group_by(Cluster, tract) %>%
+  summarize(
+    LON = return_mean_lon(lon, lat, employment),
+    LAT = return_mean_lat(lon, lat, employment),
+    max_employment = max(employment),
+    employment = sum(employment),
+    estabs = n(),
+  )
+
+# this creates a Cluster wide summary, to get an idea of the big picture
+# and determine which clutsers aren't sufficiently large enough to map this way
+df_ClusterSummary <- df %>%
+  group_by(Cluster) %>%
+  summarize(
+    max_employment = max(employment),
+    employment = sum(employment),
+    estabs = n()
+  )
+```
+
+
+## "Meeting Criteria"
+
+This calculates which clusters would meet the Criteria set in the function (at the top of the document).
+Then, any clusters which can't meet criteria as a single point get removed.
+
+This is a good time to hand inspect the results, and consider adjusting criteria if any "problem clusters" need a point on your map.
+
+
+```{r init_calc_criteria}
+
+
+
+# these are the clusters that won't meet your "completeness" criteria (set above)
+# if this list is very long and includes industries you actually know are significant
+# in your region -- you should probably get more data: make your region bigger
+problem_clusters <- df_ClusterSummary %>%
+  filter((max_employment / employment) > MAX_MAXEMP_RATIO | estabs < MIN_ESTABS)
+
+kable(problem_clusters, caption = "Clusters that won't meet your criteria due to low establishment count or employment weight")
+
+
+# create a list of clusters from only the clusters that appear in the reigon
+cluster_list <- unique(df_ClusterSummary$Cluster)
+
+# Create a list of clusters that should be excluded
+# NA in our crosswalk corresponds to NAICS 814110; private households
+# We excluded clusters that may have too few establishments to meet criteria.
+cluster_exclusions <- c("NA", unique(problem_clusters$Cluster))
+
+# this is the list of clusters that will be mapped to 'center of gravity'
+cluster_list <- cluster_list[!cluster_list %in% cluster_exclusions]
+
+
+df_byseed %<>% filter(Cluster %in% cluster_list)
+
+# this is a workaround for a bug that gives
+# "Unknown or uninitialised column" warnings when
+# new columns are created in tibble data frames.
+# its entirely unnecessary to the function of the code
+df_byseed$max_emp_ratio <- NA
+df_byseed$MeetsCriteria <- NA
+
+# get the ratio of the maximum number of emp. in single estab
+# to the total emp across estabs  for each point
+df_byseed$max_emp_ratio <- df_byseed$max_employment / df_byseed$employment
+
+# determine if which points meet the "completeness criteria"
+df_byseed$MeetsCriteria <- meets_criteria(df_byseed[, c("estabs", "max_emp_ratio")])
+```
+
+## Calculate Centers of Gravity
+
+This is a "lazy nearest neighbor" approach to create centers of gravity starting from the largest initial concentrations.
+
+It starts with the tract level points for each cluster, and for each point that does not meet a "completeness criteria", the point looks for the point's nearest same-cluster neighbor, and merges  with the nearest neighbor, and recalculates the "completeness criteria" until all remaining points are "complete". In each Point Merge, location is re-calculated based on the employment weighted mean distance between the two points.
+
+In plain english: a small tract that has 20 jobs in a specific cluster when merged with a larger tract point that has 20,000 jobs, won't have much "weight" to move that larger tract point very far from where it started, even if it is 10 miles away. However, the merged point created by two small tracts, one with 15 jobs and one with 20 jobs, that are 10 miles away will land several miles from where each started. Looking on a map, generally speaking a small company 3 person company in Eaton, Colorado (small town) is probably going to get agglomerated into a point on the outskirts of Greeley Colorado (county seat, medium city) that has more establishments and more employees than the "lone outpost" point in Eaton. That point will move a very tiny distance away from Greeley and toward Eaton because of the "pull" generated by the agglomeration.
+
+This is built on the assumption that it is "better" to agglomerate distant small-employment points with larger-employment points when the distance between point A and merge candidates B and C is the same.
+
+This is all based on a mental model that assumes multiple large centers of employment exist in cities and there are smaller areas with lower employment distal to cities. This mental model views the cities/towns as the  "natural" centers of gravity to which distal outliers will get dragged (and merged).
+
+
+for points in each cluster
+
+1. Sort data such that the largest employment size clusters float to the top
+2. Check points to see if they meets the criteria for being a center of gravity and flag T/F
+3. for all FALSE flags, calculate nearest neighbor distance to all points
+4. merge all FALSE flagged points with their nearest neighbor (employment size breaks ties)
+5. Repeat until cluster points are 100% TRUE or max loop count is met (and some clusters don't meet criteria)
+
+
+
+```{r create_final}
+
+df_byseed <- df_byseed[order(df_byseed$employment), ]
+
+# this is lazily creating a new empty DF with the same columnames as df_byseed
+df_final <- df_byseed[1, ] # create df with 1st row
+df_final <- df_final[-1, ] # remove all that row of data, leaving the headers
+
+
+
+# LOOPS in R are generally a terrible idea because of how R manages memory.
+# they can run very slow. It's best to avoid data frame operations in loops.
+# this violates all of that good advice, because it is slow,
+# but not painfully so for my region.
+# to complete this type of mapping for a very large region with many points
+# one should rewrite this section to increase efficiency / reduce loop memory overhead
+
+for (cluster_name in cluster_list) {
+  print(paste0("Assembling points for: ", cluster_name))
+
+  # filter to single cluster
+  x <- df_byseed %>% filter(Cluster == cluster_name)
+
+  x$max_emp_ratio <- x$max_employment / x$employment
+
+  x$MeetsCriteria <- meets_criteria(x)
+
+  ## ID neighbors
+  x <- x[which(!(is.na(x$LON))), ]
+  x$mergewith <- NA
+  x$ID <- NA
+  x$ID <- x$tract
+
+  ## Identify first merge candidates
+  ## this function returns the df with "mergewith" populated
+  ## see function def for details.
+  x <- get_merge_candidates(x)
+
+  ## iterate through x, collect merge candidates, merge
+
+  LOOP <- TRUE
+
+  # create a failsafe to prevent infinite while loop
+  # if merge attempts merge n rows over n interations,
+  # and there are still rows not at criteria, then it
+  # will never get to criteria
+  max_loops <- dim(x)[1]
+  loopcount <- 1 ## this is a failsafe on the while loop
+
+  while (LOOP & loopcount <= max_loops) {
+    x <- x[order(-x$MeetsCriteria, -x$employment), ]
+    k1 <- which(x$MeetsCriteria == FALSE)
+    if (length(k1 > 0)) {
+      k <- k1[1]
+      if (x$MeetsCriteria[k] == FALSE) {
+        nearest_target <- x$mergewith[k]
+        if (!(is.na(nearest_target))) {
+          mergeIDs <- which(x$mergewith == nearest_target)
+          if (!(x$mergewith[k] %in% x$ID[mergeIDs])) {
+            x <- merge_rows(x, x$mergewith[k], x$ID[mergeIDs])
+            mergeIDS <- NULL
+          }
+          x$MeetsCriteria <- meets_criteria(x)
+          x <- get_merge_candidates(x)
+        }
+      }
+    } else {
+      LOOP <- FALSE
+    }
+    loopcount <- loopcount + 1
+  }
+  print(paste0(
+    loopcount - 1, " loops happened, cluster max_loops: ", max_loops,
+    ", ratio: ", round((loopcount - 1) / max_loops, 2)
+  ))
+
+  df_final <- rbind(df_final, x)
+}
+
+if (FALSE %in% df_final$MeetsCriteria) {
+  print(paste0("At least 1 point in final data frame ",
+               "doesn't meet criteria. Check output."))
+
+}
+```
+
+
+## Presenting Data
+
+We created a simple app (elsewhere in this package) that displays these clusters in a Leaflet map
+
+We used data that comes from multiple sources, including augmenting some records with our own internal data. So, we used a different "meets criteria" rule than we're sharing here and not publishing that criteria -- ours was designed to create fewer larger clusters, and further obfuscated our raw data by taking additional steps in our display data. We're describing these steps because if you used data that you can't expose in a digital map due to EULA or other reasons, you'll need to take further steps before sharing the resulting maps outside of your own desktop. Web maps generally expose all the location and geometric data that are in them. This one is no different.
+
+Those steps included
+
+1. Recalculating employment size as a "display size" for map markers. This wasn't a strict linear scale (so that one can't reconstruct employment count from display size and some constant). We provide a simplified (strictly linear) rescaling below. If you need to protect the underlying data -- you need to come up with a different scaling, because this is easily reversible.
+
+2. Recalculating employment size as bin sizes per cluster for reporting employment per point in the map pop ups. (example below)
+
+3. Scrubbing display data tables of employment, max_employment and max_emp_ratio variables before adding them to the map. (examples in section below)
+
+4. And of course, excluding any other variables that could be sensitive or would need to be masked to avoid breaking a EULA.
+
+
+```{r }
+# 1. CALCULATE DISPLAY SIZE
+
+# this is a simple rescaling. It is perfectly reversible,
+# & not sufficient if data source necessitates privacy protection.
+# whatever your scaling, if you want a point to be visible on the map,
+# it needs to be >0.
+
+df_final$scaled_emp <- rescale(df_final$employment, to = c(.01,1 ))
+
+
+
+## 2. make nice "display bins" for employment count categories
+
+# set your bin values. these are just examples.
+# this assumes that there are NO df_final rows with values BELOW the first item (bin_range[1])
+bin_range <- c(1, 10, 20, 50, 100, 250, 500, 1000, 5000, 10000)
+
+options("scipen" = 100000, "digits" = 4)
+
+# create a list of "nice names" for your bins ("1 to 100", etc.)
+bin_names <- c()
+
+for (i in c(1:(length(bin_range) - 1))) {
+  bin_names <- c(bin_names, c(paste0(
+    format(bin_range[i], big.mark = ","),
+    " to ",
+    format(bin_range[i + 1], big.mark = ",")
+  )))
+}
+
+bin_names <- c(bin_names, paste0(format(bin_range[length(bin_range)],
+                                        big.mark = ","), "+"))
+
+
+# this works with a range the size in the example above
+# You'll need to add/delete rows if using a different number of bins
+df_final %<>% mutate(nice_emp_bin = case_when(
+  employment >= bin_range[1] & employment < bin_range[2] ~ bin_names[1],
+  employment >= bin_range[2] & employment < bin_range[3] ~ bin_names[2],
+  employment >= bin_range[3] & employment < bin_range[4] ~ bin_names[3],
+  employment >= bin_range[4] & employment < bin_range[5] ~ bin_names[4],
+  employment >= bin_range[5] & employment < bin_range[6] ~ bin_names[5],
+  employment >= bin_range[6] & employment < bin_range[7] ~ bin_names[6],
+  employment >= bin_range[7] & employment < bin_range[8] ~ bin_names[7],
+  employment >= bin_range[8] & employment < bin_range[9] ~ bin_names[8],
+  employment >= bin_range[9] & employment < bin_range[10] ~ bin_names[9],
+  employment >= bin_range[10] ~ bin_names[10]
+))
+
+
+## 3. delete the columns that aren't needed for the app....
+df_final %<>% select(-c(ID, MeetsCriteria, mergewith, max_emp_ratio,
+  employment, max_employment))
+
+
+## save the final data frame.
+write_csv(df_final, OUTPUT_FILENAME)
+```
